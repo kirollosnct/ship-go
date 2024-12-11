@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,9 +24,6 @@ type WebsocketConnection struct {
 	// The implementation handling message processing
 	dataProcessing api.WebsocketDataReaderInterface
 
-	// The connection was closed
-	closeChannel chan struct{}
-
 	// The ship write channel for outgoing SHIP messages
 	shipWriteChannel chan []byte
 
@@ -37,10 +35,15 @@ type WebsocketConnection struct {
 
 	remoteSki string
 
-	muxConnClosed sync.Mutex
-	muxShipWrite  sync.Mutex
-	muxConWrite   sync.Mutex
-	shutdownOnce  sync.Once
+	muxConnClosed      sync.Mutex
+	muxShipWrite       sync.Mutex
+	muxConWrite        sync.Mutex
+	closeShipWriteOnce sync.Once
+	shutdownOnce       sync.Once
+	shipReadCtx        context.Context
+	shipWriteCtx       context.Context
+	shipReadCancelCtx  context.CancelCauseFunc
+	shipWriteCancelCtx context.CancelCauseFunc
 }
 
 // create a new websocket based shipDataProcessing implementation
@@ -56,6 +59,9 @@ func NewWebsocketConnection(conn *websocket.Conn, remoteSki string) *WebsocketCo
 func (w *WebsocketConnection) setConnClosedError(err error) {
 	w.muxConnClosed.Lock()
 	defer w.muxConnClosed.Unlock()
+
+	w.shipReadCancelCtx(err)
+	w.shipWriteCancelCtx(err)
 
 	w.connectionClosed = true
 
@@ -81,7 +87,10 @@ func (w *WebsocketConnection) isConnClosed() bool {
 
 func (w *WebsocketConnection) run() {
 	w.shipWriteChannel = make(chan []byte, 1024) // Send outgoing ship messages
-	w.closeChannel = make(chan struct{}, 1)      // Listen to close events
+
+	ctx := context.Background()
+	w.shipReadCtx, w.shipReadCancelCtx = context.WithCancelCause(ctx)
+	w.shipWriteCtx, w.shipWriteCancelCtx = context.WithCancelCause(ctx)
 
 	go w.readShipPump()
 	go w.writeShipPump()
@@ -92,12 +101,12 @@ func (w *WebsocketConnection) writeShipPump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		w.closeShipWriteChannel()
 	}()
 
 	for {
 		select {
-		case <-w.closeChannel:
+		case <-w.shipWriteCtx.Done():
+			logging.Log().Debug(w.remoteSki, w.shipWriteCtx.Err().Error()) // "ship write pump closed"
 			return
 
 		case message, ok := <-w.shipWriteChannel:
@@ -111,10 +120,6 @@ func (w *WebsocketConnection) writeShipPump() {
 				_ = w.writeMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			w.muxConWrite.Lock()
-			_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			w.muxConWrite.Unlock()
 
 			if !w.writeMessage(websocket.BinaryMessage, message) {
 				return
@@ -134,9 +139,6 @@ func (w *WebsocketConnection) handlePing() {
 		return
 	}
 
-	w.muxConWrite.Lock()
-	_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	w.muxConWrite.Unlock()
 	_ = w.writeMessage(websocket.PingMessage, nil)
 }
 
@@ -153,7 +155,8 @@ func (w *WebsocketConnection) readShipPump() {
 
 	for {
 		select {
-		case <-w.closeChannel:
+		case <-w.shipReadCtx.Done():
+			logging.Log().Debug(w.remoteSki, "websocket read pump closed:", w.shipReadCtx.Err().Error())
 			return
 
 		default:
@@ -233,7 +236,7 @@ func (w *WebsocketConnection) close() {
 
 		w.setConnClosedError(nil)
 
-		close(w.closeChannel)
+		// close moved to setConnClosedError
 
 		if w.conn != nil {
 			_ = w.conn.Close()
@@ -253,12 +256,14 @@ func (w *WebsocketConnection) InitDataProcessing(dataProcessing api.WebsocketDat
 func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) error {
 	w.muxShipWrite.Lock()
 	defer w.muxShipWrite.Unlock()
-
 	if w.isConnClosed() || w.shipWriteChannel == nil {
 		return errors.New(connIsClosedError)
 	}
 
 	select {
+	case <-w.shipWriteCtx.Done():
+		w.closeShipWriteChannel()
+		return errors.New(connIsClosedError)
 	case w.shipWriteChannel <- message:
 	default:
 		// too many messages are pending, this doesn't look good
@@ -293,7 +298,7 @@ func (w *WebsocketConnection) writeMessageWithoutErrorHandling(messageType int, 
 
 	w.muxConWrite.Lock()
 	defer w.muxConWrite.Unlock()
-
+	_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return w.conn.WriteMessage(messageType, data)
 }
 
@@ -320,7 +325,9 @@ func (w *WebsocketConnection) IsDataConnectionClosed() (bool, error) {
 }
 
 func (w *WebsocketConnection) closeShipWriteChannel() {
-	w.muxShipWrite.Lock()
-	defer w.muxShipWrite.Unlock()
-	close(w.shipWriteChannel)
+	// w.muxShipWrite.Lock()
+	// defer w.muxShipWrite.Unlock()
+	w.closeShipWriteOnce.Do(func() {
+		close(w.shipWriteChannel)
+	})
 }

@@ -145,6 +145,67 @@ func (s *WebsocketSuite) TestWriteBufferFull() {
 	assert.Greater(s.T(), amountNil, 0)
 }
 
+func (s *WebsocketSuite) TestWriteChannelClosedWithClosing() {
+	msg := []byte{1}
+	msg = append(msg, []byte("message")...)
+	closeSignal := make(chan interface{}, 1)
+	go func() {
+		<-time.After(200 * time.Millisecond)
+		s.sut.close()
+		closeSignal <- nil
+	}()
+	for i := 0; i < 10000; i++ {
+		err := s.sut.WriteMessageToWebsocketConnection(msg)
+		if !s.sut.isConnClosed() {
+			if err != nil && strings.Contains(err.Error(), "buffer") {
+				continue
+			}
+			assert.Nil(s.T(), err)
+		} else {
+			assert.NotNil(s.T(), err)
+		}
+	}
+	<-closeSignal
+	for i := 0; i < 10000; i++ {
+		err := s.sut.WriteMessageToWebsocketConnection(msg)
+		if !s.sut.isConnClosed() {
+			assert.Nil(s.T(), err)
+		} else {
+			assert.NotNil(s.T(), err)
+		}
+	}
+}
+
+func (s *WebsocketSuite) TestWriteChannelClosedWithoutClosing() {
+	msg := []byte{1}
+	msg = append(msg, []byte("message")...)
+	beforeCloseSignal := make(chan interface{})
+	afterCloseSignal := make(chan interface{})
+	go func() {
+		<-time.After(5 * time.Second)
+		beforeCloseSignal <- nil
+		s.sut.shipWriteCancelCtx(errors.New("shipWrite closed"))
+		<-time.After(5 * time.Second)
+		afterCloseSignal <- nil
+	}()
+	for i := 0; i < 10000; i++ {
+		err := s.sut.WriteMessageToWebsocketConnection(msg)
+		if err != nil && strings.Contains(err.Error(), "buffer") {
+			continue
+		}
+		assert.Nil(s.T(), err)
+	}
+	<-beforeCloseSignal
+	<-afterCloseSignal
+	for i := 0; i < 10000; i++ {
+		err := s.sut.WriteMessageToWebsocketConnection(msg)
+		if err != nil && strings.Contains(err.Error(), "buffer") {
+			continue
+		}
+		assert.NotNil(s.T(), err)
+	}
+}
+
 func (s *WebsocketSuite) TestPingPeriod() {
 	isClosed, err := s.sut.IsDataConnectionClosed()
 	assert.Equal(s.T(), false, isClosed)
