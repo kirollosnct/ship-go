@@ -260,14 +260,19 @@ func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) 
 		return errors.New(connIsClosedError)
 	}
 
+	// Prioritize select on context.Done first before attempting to write on channel.
+	// Running a single select would sometimes detect context cancellation very late and would fail the unit test.
 	select {
 	case <-w.shipWriteCtx.Done():
 		w.closeShipWriteChannel()
 		return errors.New(connIsClosedError)
-	case w.shipWriteChannel <- message:
 	default:
-		// too many messages are pending, this doesn't look good
-		return errors.New("could not send message, buffer is full")
+		select {
+		case w.shipWriteChannel <- message:
+		default:
+			// too many messages are pending, this doesn't look good
+			return errors.New("could not send message, buffer is full")
+		}
 	}
 
 	return nil

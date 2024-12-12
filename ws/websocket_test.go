@@ -182,10 +182,10 @@ func (s *WebsocketSuite) TestWriteChannelClosedWithoutClosing() {
 	beforeCloseSignal := make(chan interface{})
 	afterCloseSignal := make(chan interface{})
 	go func() {
-		<-time.After(5 * time.Second)
+		<-time.After(1 * time.Second)
 		beforeCloseSignal <- nil
 		s.sut.shipWriteCancelCtx(errors.New("shipWrite closed"))
-		<-time.After(5 * time.Second)
+		<-time.After(1 * time.Second)
 		afterCloseSignal <- nil
 	}()
 	for i := 0; i < 10000; i++ {
